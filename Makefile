@@ -1,7 +1,12 @@
 all: eus-installed irteus-installed manuals bashrc.eus
 
-GIT_EUSURL ?= http://github.com/euslisp/EusLisp
-GIT_EUSBRANCH ?= master
+# defaults point at our own EusLisp fork/branch (GLU tessellation
+# collector, see euslisp/EusLisp#542) instead of upstream, so a plain
+# `git clone` of this fork + `make` picks it up automatically without
+# needing to know to override these -- still overridable as usual
+# (GIT_EUSURL=... GIT_EUSBRANCH=... make).
+GIT_EUSURL ?= git@github.com:inabajsk/EusLisp
+GIT_EUSBRANCH ?= glu-tess-collector
 
 EUSC_PATCH=eus.c_CUSTUM_EUSDIR.patch
 

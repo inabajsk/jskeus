@@ -68,7 +68,7 @@ MACHINE=$(shell gcc -dumpmachine | sed 's/\(.*\)-.*-.*/\1/')
 THREAD= -DTHREADED -DPTHREAD
 
 CFLAGS=-O2 -D$(MACHINE) -D$(ARCH) -DLinux -DARM -D_REENTRANT -DGCC -I$(EUSDIR)/include $(THREAD) -DSVNVERSION=$(SVNVERSION) -fPIC
-CXXFLAGS=$(CFLAGS)
+CXXFLAGS:=$(CFLAGS)
 
-CFLAGS+= -g -falign-functions=4
+CFLAGS+= -g -falign-functions=4 -std=gnu17
 CXXFLAGS+=-g -falign-functions=4

@@ -377,6 +377,123 @@
    ((= (length (send f :edges)) 3) (list f))
    (t (face-to-triangle f))))
 
+;;
+;; face-to-triangle-aux is a hand-written ear-clipping algorithm
+;; (bridging every hole into the outer contour, then clipping ears one
+;; at a time, each validated against every remaining vertex): its cost
+;; grows at least O(n^2) in the number of resulting vertices, which is
+;; impractically slow for faces with many holes (a real CAD-derived
+;; part with 24 holes/206 vertices took ~65s to triangulate this way).
+;;
+;; libGLU's sweep-line tessellator solves the same problem in a tiny
+;; fraction of the time (the same face: ~0.003s), and is already
+;; linked into eusgl for on-screen rendering -- but its GLU_BEGIN/
+;; GLU_VERTEX/GLU_END callbacks were only ever wired to draw
+;; immediately. eus_tess_reset/eus_tess_begin_cb/eus_tess_vertex_cb/
+;; eus_tess_end_cb/eus_tess_error_cb (lisp/opengl/src/util.c,
+;; registered the same way as alloctessinfo/tess_vertex_cb) record the
+;; tessellated output into memory instead, so it can be read back as
+;; data with no live GL context or open window required.
+;;
+;; Only the GL-enabled build (eusgl/irteusgl, via irtgl.l) links GLU at
+;; all -- pqp.l's collision-model construction, which is what actually
+;; benefits most from this, is also loaded by the plain (non-GL)
+;; eus/irteus build, so face-to-triangle-fast below must degrade
+;; safely to the original ear-clipping path when the collector isn't
+;; available, rather than erroring.
+(defvar *glu-tess-obj* nil)
+
+(defun glu-tess-setup ()
+  (unless *glu-tess-obj*
+    (setq *glu-tess-obj* (gl::gluNewTess))
+    (gl::gluTessCallbackl *glu-tess-obj* 100100 ;; GLU_BEGIN
+			  (#'gl::eus_tess_begin_cb . entry) (#'gl::eus_tess_begin_cb . entry2))
+    (gl::gluTessCallbackl *glu-tess-obj* 100101 ;; GLU_VERTEX
+			  (#'gl::eus_tess_vertex_cb . entry) (#'gl::eus_tess_vertex_cb . entry2))
+    (gl::gluTessCallbackl *glu-tess-obj* 100102 ;; GLU_END
+			  (#'gl::eus_tess_end_cb . entry) (#'gl::eus_tess_end_cb . entry2))
+    (gl::gluTessCallbackl *glu-tess-obj* 100103 ;; GLU_ERROR
+			  (#'gl::eus_tess_error_cb . entry) (#'gl::eus_tess_error_cb . entry2))))
+
+;; triangulates face f (which may have holes) via GLU, returning a
+;; list of (#f(x0 y0 z0) #f(x1 y1 z1) #f(x2 y2 z2)) vertex triples, or
+;; nil if GLU itself reported an error (caller should fall back to the
+;; face object based method in that case).
+(defun glu-triangulate-face (f)
+  (glu-tess-setup)
+  (gl::eus_tess_reset)
+  (let* ((holes (send f :holes))
+	 (l-tessinfo
+	  (mapcar #'(lambda (p) (gl::alloctessinfo p 0 nil 0 nil))
+		  (cdr (send f :vertices)))))
+    (gl::gluTessBeginPolygon *glu-tess-obj* 0)
+    (gl::gluTessBeginContour *glu-tess-obj*)
+    (mapc #'(lambda (i) (gl::gluTessVertex *glu-tess-obj* i i)) l-tessinfo)
+    (gl::gluTessEndContour *glu-tess-obj*)
+    (dolist (hole holes)
+      (let ((h-l-tessinfo
+	     (mapcar #'(lambda (p) (gl::alloctessinfo p 0 nil 0 nil))
+		     (send hole :vertices))))
+	(gl::gluTessBeginContour *glu-tess-obj*)
+	(gl::gluNextContour *glu-tess-obj* 100122) ;; GLU_INTERIOR
+	(mapc #'(lambda (i) (gl::gluTessVertex *glu-tess-obj* i i)) h-l-tessinfo)
+	(gl::gluTessEndContour *glu-tess-obj*)
+	(nconc l-tessinfo h-l-tessinfo)))
+    (gl::gluTessEndPolygon *glu-tess-obj*)
+    (mapc #'unix:free l-tessinfo))
+  (if (zerop (gl::eus_tess_get_error))
+      (let* ((nv (let ((total 0))
+		   (dotimes (b (gl::eus_tess_num_batches)) (incf total (gl::eus_tess_batch_count_at b)))
+		   total))
+	     (verts (make-array nv))
+	     (tmp (float-vector 0 0 0)))
+	(dotimes (i nv)
+	  (gl::eus_tess_get_vertexfv i tmp)
+	  (setf (aref verts i) (copy-seq tmp)))
+	(let (triangles)
+	  (dotimes (b (gl::eus_tess_num_batches))
+	    (let* ((mode (gl::eus_tess_batch_mode_at b))
+		   (start (gl::eus_tess_batch_start_at b))
+		   (count (gl::eus_tess_batch_count_at b)))
+	      (cond
+	       ((= mode 4) ;; GL_TRIANGLES
+		(do ((i 0 (+ i 3))) ((> (+ i 3) count))
+		  (push (list (aref verts (+ start i)) (aref verts (+ start i 1)) (aref verts (+ start i 2))) triangles)))
+	       ((= mode 6) ;; GL_TRIANGLE_FAN
+		(let ((v0 (aref verts start)))
+		  (do ((i 1 (1+ i))) ((>= (1+ i) count))
+		    (push (list v0 (aref verts (+ start i)) (aref verts (+ start i 1))) triangles))))
+	       ((= mode 5) ;; GL_TRIANGLE_STRIP
+		(do ((i 0 (1+ i))) ((>= (+ i 2) count))
+		  (if (evenp i)
+		      (push (list (aref verts (+ start i)) (aref verts (+ start i 1)) (aref verts (+ start i 2))) triangles)
+		    (push (list (aref verts (+ start i 1)) (aref verts (+ start i)) (aref verts (+ start i 2))) triangles))))
+	       (t (warn ";; glu-triangulate-face: unknown primitive mode ~A~%" mode)))))
+	  (nreverse triangles)))
+    nil))
+
+(defun triangle-to-face (v0 v1 v2)
+  (make-face-from-vertices (list (cons v0 nil) (cons v1 nil) (cons v2 nil))))
+
+;; computed once: does this build actually link GLU with the
+;; tessellation-collector callbacks (only true for eusgl/irteusgl,
+;; built from a core that has them -- see lisp/opengl/src/util.c)?
+(defparameter *glu-tess-available*
+  (and (fboundp 'gl::eus_tess_reset) (fboundp 'gl::gluNewTess)))
+
+(defun face-to-triangle-fast (f)
+  "Drop-in replacement for face-to-triangle-aux that triangulates via
+libGLU when available (see the comment above), falling back to the
+original ear-clipping implementation when it isn't (a non-GL build) or
+when GLU reports an error for this particular face."
+  (cond
+    ((null f) nil)
+    ((= (length (send f :edges)) 3) (list f))
+    (t (let ((tris (and *glu-tess-available* (glu-triangulate-face f))))
+	 (if tris
+	     (mapcar #'(lambda (tr) (apply #'triangle-to-face tr)) tris)
+	   (face-to-triangle-aux f))))))
+
 (defun face-to-triangle (f)
   "convert face to set of triangles."
   (if (and (derivedp f face) (send f :holes))

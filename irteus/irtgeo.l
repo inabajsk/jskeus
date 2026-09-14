@@ -494,6 +494,181 @@ when GLU reports an error for this particular face."
 	     (mapcar #'(lambda (tr) (apply #'triangle-to-face tr)) tris)
 	   (face-to-triangle-aux f))))))
 
+;; --- face-to-triangle-delaunay: a from-scratch, dependency-free 2D
+;; Delaunay triangulation (Bowyer-Watson incremental algorithm), added
+;; purely to compare mesh quality against face-to-triangle-aux
+;; (ear-clipping) and face-to-triangle-fast (GLU sweep-line) above --
+;; not used by pqp.l or irtgl.l, and not intended as a third
+;; production triangulation option. Delaunay triangulation maximizes
+;; the minimum angle over all triangulations of a point set (the
+;; "empty circumcircle" property), so it tends to avoid the long thin
+;; slivers ear-clipping and GLU can both produce; see the area-quality
+;; comparison test in test/test-triangulation.l.
+;;
+;; This is a plain double-precision implementation, not one using
+;; adaptive/exact arithmetic predicates the way production Delaunay
+;; libraries (e.g. Shewchuk's Triangle) do, and it is O(n^2) (no
+;; spatial acceleration structure) -- it exists for the mesh-quality
+;; comparison, not for speed: it is markedly slower than
+;; face-to-triangle-aux on non-symmetric inputs and utterly
+;; uncompetitive with face-to-triangle-fast (GLU), which remains the
+;; right choice for pqp.l/irtgl.l's actual use case.
+
+(defun cross2d (o a b)
+  (- (* (- (car a) (car o)) (- (cadr b) (cadr o)))
+     (* (- (cadr a) (cadr o)) (- (car b) (car o)))))
+
+(defun tri-area-2d (tr)
+  (abs (/ (cross2d (first tr) (second tr) (third tr)) 2.0)))
+
+(defun ccw3 (a b c)
+  ;; reorder a b c to be counter-clockwise (positive signed area)
+  (if (> (cross2d a b c) 0) (list a b c) (list a c b)))
+
+(defun in-circumcircle (a b c p)
+  ;; a b c assumed CCW. t if p is inside their circumcircle.
+  (let* ((ax (- (car a) (car p))) (ay (- (cadr a) (cadr p)))
+         (bx (- (car b) (car p))) (by (- (cadr b) (cadr p)))
+         (cx (- (car c) (car p))) (cy (- (cadr c) (cadr p)))
+         (det (+ (* ax (- (* by (+ (* cx cx) (* cy cy))) (* cy (+ (* bx bx) (* by by)))))
+                 (* (- ay) (- (* bx (+ (* cx cx) (* cy cy))) (* cx (+ (* bx bx) (* by by)))))
+                 (* (+ (* ax ax) (* ay ay)) (- (* bx cy) (* by cx))))))
+    (> det 1e-9)))
+
+(defun edge-eq (e1 e2)
+  (or (and (eq (first e1) (first e2)) (eq (second e1) (second e2)))
+      (and (eq (first e1) (second e2)) (eq (second e1) (first e2)))))
+
+;; symmetric input (e.g. an evenly-spaced ring of holes) feeds
+;; Bowyer-Watson several co-circular points back to back, which is
+;; exactly where its plain double-precision in-circumcircle test is
+;; least reliable (observed: up to ~15% spurious extra area on an
+;; 8-hole ring). Randomized incremental insertion order is the
+;; standard textbook mitigation; face-to-triangle-delaunay below
+;; reorders deterministically (multiplicative hash by a prime coprime
+;; with n) instead of with actual randomness, so a result -- and any
+;; test asserting against it -- stays reproducible, and retries with a
+;; different prime (checking against the true, directly-computed
+;; polygon area each time) on the rare input where one ordering still
+;; isn't enough.
+(defun deterministic-shuffle (lst prime)
+  (let* ((n (length lst)) (i -1)
+         (pairs (mapcar #'(lambda (x) (cons (mod (* (incf i) prime) n) x)) lst)))
+    (mapcar #'cdr (sort pairs #'(lambda (a b) (< (car a) (car b)))))))
+
+(defun bowyer-watson (pts &optional (prime 7919))
+  "pts: list of (list x y), eq-distinct. returns list of CCW triangles (each a list of 3 points from PTS, super-triangle corners excluded)."
+  (setq pts (deterministic-shuffle pts prime))
+  (let* ((minx (reduce #'min (mapcar #'car pts))) (maxx (reduce #'max (mapcar #'car pts)))
+         (miny (reduce #'min (mapcar #'cadr pts))) (maxy (reduce #'max (mapcar #'cadr pts)))
+         (d (max (- maxx minx) (- maxy miny) 1.0))
+         (midx (/ (+ minx maxx) 2.0)) (midy (/ (+ miny maxy) 2.0))
+         (dd (* 20 d))
+         (p1 (list (- midx dd) (- midy dd)))
+         (p2 (list midx (+ midy dd dd)))
+         (p3 (list (+ midx dd) (- midy dd)))
+         (triangles (list (ccw3 p1 p2 p3))))
+    (dolist (p pts)
+      (let (bad-triangles good-triangles)
+        (dolist (tr triangles)
+          (if (in-circumcircle (first tr) (second tr) (third tr) p)
+              (push tr bad-triangles)
+            (push tr good-triangles)))
+        (let (all-edges boundary)
+          (dolist (tr bad-triangles)
+            (push (list (first tr) (second tr)) all-edges)
+            (push (list (second tr) (third tr)) all-edges)
+            (push (list (third tr) (first tr)) all-edges))
+          (dolist (e all-edges)
+            (when (= 1 (count-if #'(lambda (e2) (edge-eq e e2)) all-edges))
+              (push e boundary)))
+          (setq triangles good-triangles)
+          (dolist (e boundary)
+            (push (ccw3 (first e) (second e) p) triangles)))))
+    (remove-if #'(lambda (tr) (or (member p1 tr :test #'eq) (member p2 tr :test #'eq) (member p3 tr :test #'eq)))
+               triangles)))
+
+(defun point-in-polygon-2d (pt poly)
+  ;; ray-casting / even-odd rule. avoids nth+mod index arithmetic
+  ;; entirely (walks POLY paired with its own rotation-by-one instead)
+  ;; after that form was observed to occasionally corrupt under EusLisp.
+  (let ((qx (car pt)) (qy (cadr pt)) (inside nil))
+    (when (< (length poly) 3) (return-from point-in-polygon-2d nil))
+    (let ((poly-next (append (cdr poly) (list (car poly)))))
+      (mapc #'(lambda (pa pb)
+                (let ((xa (car pa)) (ya (cadr pa))
+                      (xb (car pb)) (yb (cadr pb)))
+                  (when (and (not (eq (> ya qy) (> yb qy)))
+                             (< qx (+ xa (* (/ (- xb xa) (- yb ya)) (- qy ya)))))
+                    (setq inside (not inside)))))
+            poly poly-next))
+    inside))
+
+(defun shoelace-area-2d (poly)
+  (let ((s 0.0) (poly-next (append (cdr poly) (list (car poly)))))
+    (mapc #'(lambda (a b) (incf s (- (* (car a) (cadr b)) (* (car b) (cadr a)))))
+          poly poly-next)
+    (/ (abs s) 2.0)))
+
+(defun dedupe-closed-polyline (verts)
+  ;; face/hole :vertices repeats the first vertex as a closing last
+  ;; vertex (confirmed on a plain square plate: 5 vertices for 4
+  ;; corners). that exact-duplicate point breaks Bowyer-Watson's
+  ;; circumcircle math (a zero-radius/degenerate case), so drop it.
+  (if (and (cdr verts) (< (norm (v- (car verts) (car (last verts)))) 1e-6))
+      (butlast verts)
+    verts))
+
+(defun face-to-triangle-delaunay (f)
+  "Constrained-Delaunay-ish triangulation of face F (possibly with
+holes): unconstrained Bowyer-Watson over all boundary+hole vertices,
+then keep only triangles whose centroid falls inside the boundary and
+outside every hole. Good enough for an area-distribution comparison;
+not a rigorous CDT (a true CDT would force-insert boundary/hole edges
+that Delaunay would otherwise flip away, which can matter for thin or
+close-together holes)."
+  (let* ((fn (send f :normal))
+         (verts (dedupe-closed-polyline (send f :vertices)))
+         (holes (send f :holes))
+         (p0 (car verts))
+         (tmp (if (> (abs (aref fn 0)) 0.9) (float-vector 0 1 0) (float-vector 1 0 0)))
+         (u (normalize-vector (v* fn tmp)))
+         (v (normalize-vector (v* fn u)))
+         (proj #'(lambda (p) (list (v. u (v- p p0)) (v. v (v- p p0)))))
+         (boundary-2d (mapcar proj verts))
+         (holes-2d (mapcar #'(lambda (h) (mapcar proj (dedupe-closed-polyline (send h :vertices)))) holes))
+         (all-3d (append verts (apply #'append (mapcar #'(lambda (h) (dedupe-closed-polyline (send h :vertices))) holes))))
+         (all-2d (append boundary-2d (apply #'append holes-2d)))
+         (map3d (make-hash-table :test #'eq)))
+    (mapc #'(lambda (p3 p2) (setf (gethash p2 map3d) p3)) all-3d all-2d)
+    (let ((expected-area (- (shoelace-area-2d boundary-2d)
+                            (apply #'+ (mapcar #'shoelace-area-2d holes-2d))))
+          (primes '(7919 104729 15485863 999983 32452867))
+          kept)
+      (dolist (prime primes)
+        (let ((raw (bowyer-watson all-2d prime))
+              (this-kept nil))
+          (dolist (tr raw)
+            (let* ((cx (/ (+ (car (first tr)) (car (second tr)) (car (third tr))) 3.0))
+                   (cy (/ (+ (cadr (first tr)) (cadr (second tr)) (cadr (third tr))) 3.0))
+                   (c (list cx cy)))
+              (when (and (point-in-polygon-2d c boundary-2d)
+                         (not (some #'(lambda (h2d) (point-in-polygon-2d c h2d)) holes-2d)))
+                (push tr this-kept))))
+          (setq kept this-kept)
+          (when (< (abs (- (apply #'+ (mapcar #'tri-area-2d this-kept)) expected-area))
+                   (* 1e-6 expected-area))
+            (return))))
+      (unless (< (abs (- (apply #'+ (mapcar #'tri-area-2d kept)) expected-area))
+                 (* 1e-3 expected-area))
+        (warn ";; face-to-triangle-delaunay: kept-triangle area still off by more than 0.1% of the true polygon area after trying ~A insertion orders -- this face's point layout is an unusually hard case for this plain double-precision Bowyer-Watson (see comment above deterministic-shuffle); result may be visibly wrong.~%"
+              (length primes)))
+      (mapcar #'(lambda (tr) (make-face-from-vertices
+                              (list (cons (gethash (first tr) map3d) nil)
+                                    (cons (gethash (second tr) map3d) nil)
+                                    (cons (gethash (third tr) map3d) nil))))
+              kept))))
+
 (defun face-to-triangle (f)
   "convert face to set of triangles."
   (if (and (derivedp f face) (send f :holes))

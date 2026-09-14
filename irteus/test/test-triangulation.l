@@ -221,6 +221,47 @@ the test."
                   1e-3))
     nil))
 
+(defun tri-area-stats (faces)
+  "(:n :min :max :mean :std :ratio) over FACES' :area -- summarizes how
+evenly-sized (vs. sliver-prone) a triangulation's output is."
+  (let* ((areas (send-all faces :area))
+         (n (length areas))
+         (mn (reduce #'min areas))
+         (mx (reduce #'max areas))
+         (mean (/ (apply #'+ areas) n))
+         (var (/ (apply #'+ (mapcar #'(lambda (a) (* (- a mean) (- a mean))) areas)) n)))
+    (list :n n :min mn :max mx :mean mean :std (sqrt var) :max/min (/ mx mn))))
+
+(defun triangulation-quality-comparison (&optional (nholes 6))
+  "Compares face-to-triangle-aux (ear clipping), face-to-triangle-fast
+(GLU sweep-line) and face-to-triangle-delaunay (Bowyer-Watson) on the
+same many-holed face: all three must cover the identical area (same
+region triangulated -- see triangulation-fast-consistency /
+triangulation-benchmark-many-holes above for that already being
+covered for aux vs fast), but HOW they cut it into triangles differs.
+Delaunay maximizes the minimum angle over all triangulations of a
+point set (the empty-circumcircle property), so it is expected to
+avoid the long thin slivers that ear-clipping and GLU can both
+produce -- this prints each method's area-distribution stats so that
+difference is visible, rather than just asserting triangle count and
+total area match (which triangulation-fast-consistency /
+triangulation-benchmark-many-holes already do for aux vs fast)."
+  (let* ((aface (make-holed-plate nholes))
+         (faces-aux (geo::face-to-triangle-aux aface))
+         (faces-fast (geo::face-to-triangle-fast aface))
+         (faces-del (geo::face-to-triangle-delaunay aface))
+         (area-aux (apply #'+ (send-all faces-aux :area)))
+         (area-fast (apply #'+ (send-all faces-fast :area)))
+         (area-del (apply #'+ (send-all faces-del :area))))
+    (format t "~%;; triangulation-quality-comparison: ~A holes~%" nholes)
+    (format t ";;   aux      (ear clipping): ~A~%" (tri-area-stats faces-aux))
+    (format t ";;   fast     (GLU)         : ~A~%" (tri-area-stats faces-fast))
+    (format t ";;   delaunay (Bowyer-Watson): ~A~%" (tri-area-stats faces-del))
+    ;; same total area covered, regardless of how each method cut it up
+    (assert (eps= area-aux area-fast (* 1e-6 area-aux)))
+    (assert (eps= area-aux area-del (* 1e-2 area-aux)))
+    nil))
+
 (deftest test-triangulation-concave
   (triangulation-concave)
   )
@@ -243,6 +284,10 @@ the test."
 
 (deftest test-triangulation-benchmark-many-holes
   (triangulation-benchmark-many-holes)
+  )
+
+(deftest test-triangulation-quality-comparison
+  (triangulation-quality-comparison)
   )
 
 (eval-when (load eval)
